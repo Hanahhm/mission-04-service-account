@@ -127,3 +127,38 @@ A service account (`svc-app62`) that normally only runs a background application
 | Mission 4 — Kerberoast (Part 2, reproduced the theft) | submitted |
 
 *(Flag values and credentials are deliberately not reproduced in this report — the report, not the flag, is the deliverable.)*
+
+
+## Detection — catching Kerberoasting at the source (Mission 5)
+
+**Context.** In Part 2 I showed that the Kerberoasting ticket request never reached my workstation's Sentinel — it is an event written on the **domain controller**. With the DC now feeding a shared Sentinel workspace (`log-hamilton`), I hunted the request at the source, turned it into a scheduled detection rule, and proved it fires.
+
+**The rule query:**
+```kql
+SecurityEvent
+| where EventID == 4769
+| extend P = parse_xml(EventData).EventData.Data
+| mv-apply P on (summarize Bag = make_bag(bag_pack(tostring(P['@Name']), tostring(P['#text']))))
+| extend Requestor   = tostring(Bag.TargetUserName),
+         ServiceName = tostring(Bag.ServiceName),
+         Encryption  = tostring(Bag.TicketEncryptionType),
+         Ip          = tostring(Bag.IpAddress)
+| where Encryption == "0x17"          // RC4 — the weak algorithm Kerberoasting requests
+| where ServiceName !endswith "$"     // exclude machine accounts
+| where ServiceName != "krbtgt"       // exclude the ticket-granting service
+| project TimeGenerated, Requestor, ServiceName, Encryption, Ip
+```
+
+**What it detects, and why that detail gives it away.** Event **4769** is written by the domain controller every time a Kerberos service ticket (TGS) is requested. The useful fields are not in their own columns — they are packed into the event's `EventData` field as a small XML document — so the rule uses **`parse_xml`** to pull out the requesting account, the target service account, the encryption type and the source IP by name. The giveaway is the **encryption type**: a Kerberoasting tool deliberately asks for the ticket with **RC4 (`0x17`)**, the old, weak algorithm, because it is the only one it can crack offline. Over a 30-day window the workspace held **13,741** AES (`0x12`) service tickets and only **31** RC4 (`0x17`) — RC4 is ~0.2% of all ticket traffic. A service ticket requested with RC4 for a human-style service account is therefore a strong, low-noise signal of Kerberoasting.
+
+**MITRE ATT&CK:** **T1558.003** — Steal or Forge Kerberos Tickets: Kerberoasting (tactic: Credential Access).
+
+**False positives excluded, and why.** Two kinds of accounts request tickets constantly and are never what I am looking for: **machine accounts** (names ending in `$`) and the domain's own ticket-granting service, **`krbtgt`**. Both are excluded so the rule only surfaces RC4 requests for the user *service* accounts that Kerberoasting actually targets.
+
+**How often it runs and how far back it looks.** I measured the ingestion delay by replaying the ticket request and watching for it in the workspace: the event became queryable **~5 minutes** after I made the request. The rule runs **every 10 minutes** and looks back over the **last 1 hour**. The look-back (60 min) is deliberately longer than the run interval (10 min) plus the ingestion delay (~5 min): if the look-back equalled the run interval, an event that ingests late could arrive after one run's window closed and before the next one opened, and never be seen. A 1-hour look-back guarantees every event is re-scanned by the following run, and the incident grouping (match-all-entities, 5-hour window) collapses the resulting repeats into a single incident.
+
+**Proof it fired.** I replayed the ticket request at **13:29 UTC**. My rule `L62 - Kerberoasting - RC4 service ticket` raised incident **3091** at **13:35** (~6 minutes later), Medium severity. Thanks to the entity mapping, the incident shows the requesting account (`training01@HAMILTON.CORP`) and the source IP (`10.50.0.1`) directly, so a triage analyst sees who and from where without rerunning the query. *(See screenshot `step7_proof_L62.png`.)*
+
+**Triage — the attack I did not launch.** My rule caught my own replay, so to look for activity I did not cause I reviewed every RC4 service-ticket request in the shared workspace, grouped by the requesting account. One account stood out: `training01` requested RC4 tickets for **three** different service accounts (`svc-app50`, `svc-app59`, `svc-app62`), while every other account requested only its own single seat. Triaging it: the three requests are spread across **different days** (6, 9 and 12–13 Nov), one seat at a time — not a tight burst — and they all come from the lab gateway. My conclusion is that this is the **shared `training01` credential (leaked in Mission 3) being reused by several classmates**, each roasting their own seat on their own day, **not** a single attacker mass-roasting the domain. A genuine mass-roast would be one account requesting many distinct service accounts within seconds to minutes; nothing matching that pattern appeared in the queried window. If the coach triggers the surprise attack while my rule is enabled, the same rule will raise an L62 incident and I will triage it on the same criteria — who requested, for how many distinct service accounts, from where, when, and how tightly clustered in time.
+
+**What a defender in this domain still cannot see.** Every ticket request — mine and every classmate's — arrives from the same address, `::ffff:10.50.0.1`, the lab gateway that NATs all traffic. The source IP therefore shows *that* an attack happened and *which domain account* asked, but not *which physical machine* it came from: the host behind the gateway stays invisible.
